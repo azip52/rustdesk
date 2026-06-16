@@ -36,7 +36,7 @@ new file mode 100644
 index 0000000..864e8b4
 --- /dev/null
 +++ b/src/schannel_client_tls.rs
-@@ -0,0 +1,309 @@
+@@ -0,0 +1,312 @@
 +use crate::ResultType;
 +use anyhow::bail;
 +use schannel::{
