@@ -36,7 +36,7 @@ new file mode 100644
 index 0000000..864e8b4
 --- /dev/null
 +++ b/src/schannel_client_tls.rs
-@@ -0,0 +1,283 @@
+@@ -0,0 +1,304 @@
 +use crate::ResultType;
 +use anyhow::bail;
 +use schannel::{
@@ -311,13 +311,38 @@ index 0000000..864e8b4
 +        }
 +    }
 +
-+    fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-+        Poll::Ready(self.tls.flush())
++    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        loop {
++            match self.tls.flush() {
++                Ok(()) => return Poll::Ready(Ok(())),
++                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
++                    let io = self.tls.get_ref();
++                    match io.poll_blocked_ready(cx) {
++                        Poll::Ready(Ok(())) => continue,
++                        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
++                        Poll::Pending => return Poll::Pending,
++                    }
++                }
++                Err(err) => return Poll::Ready(Err(err)),
++            }
++        }
 +    }
 +
-+    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-+        self.tls.shutdown()?;
-+        Poll::Ready(Ok(()))
++    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        loop {
++            match self.tls.shutdown() {
++                Ok(()) => return Poll::Ready(Ok(())),
++                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
++                    let io = self.tls.get_ref();
++                    match io.poll_blocked_ready(cx) {
++                        Poll::Ready(Ok(())) => continue,
++                        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
++                        Poll::Pending => return Poll::Pending,
++                    }
++                }
++                Err(err) => return Poll::Ready(Err(err)),
++            }
++        }
 +    }
 +}
 diff --git a/src/socket_client.rs b/src/socket_client.rs
