@@ -1,0 +1,393 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 6ad3012..a462a6b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -51,6 +51,7 @@ base64 = "0.22"
+ url = "2.5"
+ sha2 = "0.10"
+ whoami = "1.5"
++x509-parser = "0.17"
+ 
+ tokio-rustls = { version = "0.26", features = [
+     "logging",
+@@ -81,6 +82,7 @@ clap = "4.5.51"
+ webrtc = "0.14.0"
+ 
+ [target.'cfg(target_os = "windows")'.dependencies]
++schannel = "0.1"
+ winapi = { version = "0.3", features = [
+     "winuser",
+     "synchapi",
+diff --git a/src/lib.rs b/src/lib.rs
+index 2b35642..4e99ca5 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -20,6 +20,8 @@ pub use tokio_util;
+ pub mod proxy;
+ pub mod socket_client;
+ pub mod tcp;
++#[cfg(target_os = "windows")]
++pub mod schannel_client_tls;
+ pub mod udp;
+ pub use env_logger;
+ pub use log;
+diff --git a/src/schannel_client_tls.rs b/src/schannel_client_tls.rs
+new file mode 100644
+index 0000000..864e8b4
+--- /dev/null
++++ b/src/schannel_client_tls.rs
+@@ -0,0 +1,283 @@
++use crate::ResultType;
++use anyhow::bail;
++use schannel::{
++    cert_context::{CertContext, ValidUses},
++    cert_store::CertStore,
++    schannel_cred::{Direction, SchannelCred},
++    tls_stream::{Builder as TlsBuilder, HandshakeError, MidHandshakeTlsStream, TlsStream},
++};
++use std::{
++    io::{self, Read, Write},
++    pin::Pin,
++    sync::atomic::{AtomicU8, Ordering},
++    task::{Context, Poll},
++};
++use tokio::{
++    io::{AsyncRead, AsyncWrite, ReadBuf},
++    net::TcpStream,
++};
++use x509_parser::prelude::*;
++
++const CLIENT_CERT_OU: &str = "RustDeskClient";
++const CLIENT_AUTH_OID: &str = "1.3.6.1.5.5.7.3.2";
++const BLOCKED_ON_READ: u8 = 1;
++const BLOCKED_ON_WRITE: u8 = 2;
++
++pub async fn connect(
++    stream: TcpStream,
++    server_name: &str,
++    ms_timeout: u64,
++) -> ResultType<SchannelClientTlsStream> {
++    let domain = tls_domain(server_name)?;
++    let cert = select_client_cert()?;
++    log::info!(
++        "using RustDesk mTLS client certificate: {}",
++        cert.friendly_name().unwrap_or_else(|_| "<unnamed>".to_owned())
++    );
++    let creds = SchannelCred::builder().cert(cert).acquire(Direction::Outbound)?;
++    let stream = SchannelClientIo::new(stream);
++    let tls = crate::timeout(ms_timeout, handshake(stream, creds, &domain)).await??;
++    Ok(SchannelClientTlsStream { tls })
++}
++
++async fn handshake(
++    stream: SchannelClientIo,
++    creds: SchannelCred,
++    domain: &str,
++) -> ResultType<TlsStream<SchannelClientIo>> {
++    let mut builder = TlsBuilder::new();
++    builder.domain(domain);
++    match builder.connect(creds, stream) {
++        Ok(tls) => Ok(tls),
++        Err(HandshakeError::Failure(err)) => Err(err.into()),
++        Err(HandshakeError::Interrupted(mid)) => resume_handshake(mid).await,
++    }
++}
++
++async fn resume_handshake(
++    mut mid: MidHandshakeTlsStream<SchannelClientIo>,
++) -> ResultType<TlsStream<SchannelClientIo>> {
++    loop {
++        wait_for_io(mid.get_ref()).await?;
++        match mid.handshake() {
++            Ok(tls) => return Ok(tls),
++            Err(HandshakeError::Failure(err)) => return Err(err.into()),
++            Err(HandshakeError::Interrupted(next)) => mid = next,
++        }
++    }
++}
++
++async fn wait_for_io(io: &SchannelClientIo) -> io::Result<()> {
++    match io.blocked_on.load(Ordering::Relaxed) {
++        BLOCKED_ON_READ => io.stream.readable().await,
++        BLOCKED_ON_WRITE => io.stream.writable().await,
++        _ => {
++            tokio::select! {
++                res = io.stream.readable() => res,
++                res = io.stream.writable() => res,
++            }
++        }
++    }
++}
++
++fn tls_domain(server_name: &str) -> ResultType<String> {
++    let server_name = server_name
++        .strip_prefix("tls://")
++        .or_else(|| server_name.strip_prefix("tcp://"))
++        .unwrap_or(server_name);
++    let host = if let Some(rest) = server_name.strip_prefix('[') {
++        rest.split_once(']')
++            .map(|(host, _)| host.to_owned())
++            .unwrap_or_else(|| rest.to_owned())
++    } else {
++        server_name
++            .rsplit_once(':')
++            .map(|(host, _)| host.to_owned())
++            .unwrap_or_else(|| server_name.to_owned())
++    };
++    if host.is_empty() {
++        bail!("empty TLS server name");
++    }
++    Ok(host)
++}
++
++fn select_client_cert() -> ResultType<CertContext> {
++    let store = CertStore::open_current_user("MY")?;
++    let mut matches = Vec::new();
++    for cert in store.certs() {
++        if !cert.is_time_valid().unwrap_or(false) {
++            continue;
++        }
++        if !has_private_key(&cert) {
++            continue;
++        }
++        if !has_client_auth_eku(&cert) {
++            continue;
++        }
++        if !has_rustdesk_client_ou(&cert) {
++            continue;
++        }
++        matches.push(cert);
++    }
++    match matches.len() {
++        1 => Ok(matches.remove(0)),
++        0 => bail!(
++            "no CurrentUser\\MY certificate with OU={CLIENT_CERT_OU}, clientAuth EKU, valid time, and private key was found"
++        ),
++        n => bail!(
++            "found {n} CurrentUser\\MY certificates with OU={CLIENT_CERT_OU}; keep exactly one"
++        ),
++    }
++}
++
++fn has_private_key(cert: &CertContext) -> bool {
++    cert.private_key().silent(true).acquire().is_ok()
++}
++
++fn has_client_auth_eku(cert: &CertContext) -> bool {
++    match cert.valid_uses() {
++        Ok(ValidUses::All) => true,
++        Ok(ValidUses::Oids(oids)) => oids.iter().any(|oid| oid == CLIENT_AUTH_OID),
++        Err(err) => {
++            log::warn!("failed to read certificate EKU: {err}");
++            false
++        }
++    }
++}
++
++fn has_rustdesk_client_ou(cert: &CertContext) -> bool {
++    let Ok((_, parsed)) = parse_x509_certificate(cert.to_der()) else {
++        return false;
++    };
++    parsed
++        .subject()
++        .iter_organizational_unit()
++        .filter_map(|attr| attr.as_str().ok())
++        .any(|ou| ou.eq_ignore_ascii_case(CLIENT_CERT_OU))
++}
++
++pub struct SchannelClientTlsStream {
++    tls: TlsStream<SchannelClientIo>,
++}
++
++pub struct SchannelClientIo {
++    stream: TcpStream,
++    blocked_on: AtomicU8,
++}
++
++impl SchannelClientIo {
++    fn new(stream: TcpStream) -> Self {
++        Self {
++            stream,
++            blocked_on: AtomicU8::new(0),
++        }
++    }
++
++    fn poll_blocked_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        match self.blocked_on.load(Ordering::Relaxed) {
++            BLOCKED_ON_READ => self.stream.poll_read_ready(cx).map(|res| res.map(|_| ())),
++            BLOCKED_ON_WRITE => self.stream.poll_write_ready(cx).map(|res| res.map(|_| ())),
++            _ => {
++                match self.stream.poll_read_ready(cx) {
++                    Poll::Ready(Ok(_)) => return Poll::Ready(Ok(())),
++                    Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
++                    Poll::Pending => {}
++                }
++                match self.stream.poll_write_ready(cx) {
++                    Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
++                    Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
++                    Poll::Pending => Poll::Pending,
++                }
++            }
++        }
++    }
++}
++
++impl Read for SchannelClientIo {
++    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
++        match self.stream.try_read(buf) {
++            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
++                self.blocked_on.store(BLOCKED_ON_READ, Ordering::Relaxed);
++                Err(err)
++            }
++            res => {
++                self.blocked_on.store(0, Ordering::Relaxed);
++                res
++            }
++        }
++    }
++}
++
++impl Write for SchannelClientIo {
++    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
++        match self.stream.try_write(buf) {
++            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
++                self.blocked_on.store(BLOCKED_ON_WRITE, Ordering::Relaxed);
++                Err(err)
++            }
++            res => {
++                self.blocked_on.store(0, Ordering::Relaxed);
++                res
++            }
++        }
++    }
++
++    fn flush(&mut self) -> io::Result<()> {
++        Ok(())
++    }
++}
++
++impl AsyncRead for SchannelClientTlsStream {
++    fn poll_read(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &mut ReadBuf<'_>,
++    ) -> Poll<io::Result<()>> {
++        loop {
++            match self.tls.read(buf.initialize_unfilled()) {
++                Ok(0) => return Poll::Ready(Ok(())),
++                Ok(n) => {
++                    buf.advance(n);
++                    return Poll::Ready(Ok(()));
++                }
++                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
++                    let io = self.tls.get_ref();
++                    return io.poll_blocked_ready(cx);
++                }
++                Err(err) => return Poll::Ready(Err(err)),
++            }
++        }
++    }
++}
++
++impl AsyncWrite for SchannelClientTlsStream {
++    fn poll_write(
++        mut self: Pin<&mut Self>,
++        cx: &mut Context<'_>,
++        buf: &[u8],
++    ) -> Poll<io::Result<usize>> {
++        loop {
++            match self.tls.write(buf) {
++                Ok(n) => return Poll::Ready(Ok(n)),
++                Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
++                    let io = self.tls.get_ref();
++                    match io.poll_blocked_ready(cx) {
++                        Poll::Ready(Ok(())) => continue,
++                        Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
++                        Poll::Pending => return Poll::Pending,
++                    }
++                }
++                Err(err) => return Poll::Ready(Err(err)),
++            }
++        }
++    }
++
++    fn poll_flush(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        Poll::Ready(self.tls.flush())
++    }
++
++    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
++        self.tls.shutdown()?;
++        Poll::Ready(Ok(()))
++    }
++}
+diff --git a/src/socket_client.rs b/src/socket_client.rs
+index 9178b74..7d81df2 100644
+--- a/src/socket_client.rs
++++ b/src/socket_client.rs
+@@ -143,7 +143,20 @@ pub async fn connect_tcp<
+             websocket::WsFramedStream::new(target_str, None, None, ms_timeout).await?,
+         ));
+     }
+-    connect_tcp_local(target, None, ms_timeout).await
++    #[cfg(target_os = "windows")]
++    {
++        if Config::get_socks().is_some() {
++            anyhow::bail!("RustDesk mTLS server connections do not support SOCKS proxy");
++        }
++        let target_str = target.to_string();
++        return Ok(Stream::Tcp(
++            FramedStream::new_mtls(target, None, ms_timeout, &target_str).await?,
++        ));
++    }
++    #[cfg(not(target_os = "windows"))]
++    {
++        connect_tcp_local(target, None, ms_timeout).await
++    }
+ }
+ 
+ // This function connects directly to the target without checking for websocket endpoints.
+diff --git a/src/tcp.rs b/src/tcp.rs
+index 2296edb..2faf0ba 100644
+--- a/src/tcp.rs
++++ b/src/tcp.rs
+@@ -81,6 +81,40 @@ pub(crate) fn new_socket(addr: std::net::SocketAddr, reuse: bool) -> Result<TcpS
+ }
+ 
+ impl FramedStream {
++    #[cfg(target_os = "windows")]
++    pub async fn new_mtls<T: ToSocketAddrs + std::fmt::Display>(
++        remote_addr: T,
++        local_addr: Option<SocketAddr>,
++        ms_timeout: u64,
++        server_name: &str,
++    ) -> ResultType<Self> {
++        for remote_addr in lookup_host(&remote_addr).await? {
++            let local = if let Some(addr) = local_addr {
++                addr
++            } else {
++                crate::config::Config::get_any_listen_addr(remote_addr.is_ipv4())
++            };
++            if let Ok(socket) = new_socket(local, true) {
++                if let Ok(Ok(stream)) =
++                    super::timeout(ms_timeout, socket.connect(remote_addr)).await
++                {
++                    stream.set_nodelay(true).ok();
++                    let addr = stream.local_addr()?;
++                    let stream =
++                        crate::schannel_client_tls::connect(stream, server_name, ms_timeout)
++                            .await?;
++                    return Ok(Self(
++                        Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
++                        addr,
++                        None,
++                        0,
++                    ));
++                }
++            }
++        }
++        bail!(format!("Failed to connect to {remote_addr}"));
++    }
++
+     pub async fn new<T: ToSocketAddrs + std::fmt::Display>(
+         remote_addr: T,
+         local_addr: Option<SocketAddr>,

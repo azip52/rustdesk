@@ -48,6 +48,11 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Patch hbb_common for Windows mTLS
+        shell: bash
+        run: |
+          git -C libs/hbb_common apply ../../.github/patches/hbb_common_windows_mtls.diff
+
       - name: Read version
         shell: pwsh
         run: |
