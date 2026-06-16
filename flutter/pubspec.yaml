@@ -5,17 +5,6 @@ description: Your Remote Desktop Software
 # pub.dev using `pub publish`. This is preferred for private packages.
 publish_to: "none" # Remove this line if you wish to publish to pub.dev
 
-# The following defines the version and build number for your application.
-# A version number is three numbers separated by dots, like 1.2.43
-# followed by an optional build number separated by a +.
-# Both the version and the builder number may be overridden in flutter
-# build by specifying --build-name and --build-number, respectively.
-# In Android, build-name is used as versionName while build-number used as versionCode.
-# Read more about Android versioning at https://developer.android.com/studio/publish/versioning
-# In iOS, build-name is used as CFBundleShortVersionString while build-number used as CFBundleVersion.
-# Read more about iOS versioning at
-# https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
-# 1.1.9-1 works for android, but for ios it becomes 1.1.91, need to set it to 1.1.9-a.1 for iOS, will get 1.1.9.1, but iOS store not allow 4 numbers
 version: 1.4.7+65
 
 environment:
@@ -122,22 +111,18 @@ dev_dependencies:
 
 dependency_overrides:
   intl: ^0.19.0
-  flutter_plugin_android_lifecycle: 2.0.17
 
 # rerun: flutter pub run flutter_launcher_icons
 flutter_icons:
   image_path: "../res/icon.png"
-  remove_alpha_ios: true
-  android: true
-  ios: true
+  android: false
+  ios: false
   windows:
     generate: true
-  macos:
-    image_path: "../res/mac-icon.png"
-    generate: true
-  linux: true
+  macos: false
+  linux: false
   web:
-    generate: true
+    generate: false
 
 # For information on the generic Dart part of this file, see the
 # following page: https://dart.dev/tools/pub/pubspec
