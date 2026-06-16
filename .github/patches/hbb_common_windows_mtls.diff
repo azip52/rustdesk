@@ -36,7 +36,7 @@ new file mode 100644
 index 0000000..864e8b4
 --- /dev/null
 +++ b/src/schannel_client_tls.rs
-@@ -0,0 +1,304 @@
+@@ -0,0 +1,309 @@
 +use crate::ResultType;
 +use anyhow::bail;
 +use schannel::{
@@ -188,11 +188,15 @@ index 0000000..864e8b4
 +    let Ok((_, parsed)) = parse_x509_certificate(cert.to_der()) else {
 +        return false;
 +    };
-+    parsed
-+        .subject()
-+        .iter_organizational_unit()
-+        .filter_map(|attr| attr.as_str().ok())
-+        .any(|ou| ou.eq_ignore_ascii_case(CLIENT_CERT_OU))
++    let subject = parsed.subject();
++    for attr in subject.iter_organizational_unit() {
++        if let Ok(ou) = attr.as_str() {
++            if ou.eq_ignore_ascii_case(CLIENT_CERT_OU) {
++                return true;
++            }
++        }
++    }
++    false
 +}
 +
 +pub struct SchannelClientTlsStream {
