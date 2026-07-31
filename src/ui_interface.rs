@@ -1531,7 +1531,7 @@ async fn check_id(
     id: String,
     uuid: Bytes,
 ) -> &'static str {
-    if let Ok(mut socket) = hbb_common::socket_client::connect_tcp(
+    if let Ok(mut socket) = crate::connect_rustdesk_service(
         crate::check_port(rendezvous_server, RENDEZVOUS_PORT),
         CONNECT_TIMEOUT,
     )

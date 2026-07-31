@@ -5,3 +5,6 @@
 
 # Keep rustls-platform-verifier classes for JNI
 -keep, includedescriptorclasses class org.rustls.platformverifier.** { *; }
+
+# The Rust mTLS transport loads this Kotlin bridge dynamically through JNI.
+-keep class com.carriez.flutter_hbb.AndroidMtlsSocketBridge { *; }

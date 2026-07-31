@@ -32,6 +32,17 @@ lazy_static! {
     static ref CLIPBOARDS_CLIENT: Mutex<Option<MultiClipboards>> = Mutex::new(None);
 }
 
+pub fn with_java_vm_and_application_context<T>(
+    callback: impl FnOnce(&JavaVM, &GlobalRef) -> T,
+) -> Option<T> {
+    let jvm = JVM.read().ok()?;
+    let context = APPLICATION_CONTEXT.read().ok()?;
+    match (jvm.as_ref(), context.as_ref()) {
+        (Some(jvm), Some(context)) => Some(callback(jvm, context)),
+        _ => None,
+    }
+}
+
 const MAX_VIDEO_FRAME_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_AUDIO_FRAME_TIMEOUT: Duration = Duration::from_millis(1000);
 

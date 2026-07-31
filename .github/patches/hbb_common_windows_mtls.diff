@@ -1,0 +1,372 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 6ad3012..d0db50b 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -81,6 +81,9 @@ clap = "4.5.51"
+ webrtc = "0.14.0"
+ 
+ [target.'cfg(target_os = "windows")'.dependencies]
++schannel = "=0.1.23"
++mio = { version = "=0.8.11", features = ["net", "os-poll"] }
++x509-parser = "=0.16.0"
+ winapi = { version = "0.3", features = [
+     "winuser",
+     "synchapi",
+diff --git a/src/lib.rs b/src/lib.rs
+index 2b35642..885ba32 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -29,6 +29,8 @@ pub use futures_util;
+ pub mod config;
+ pub mod fs;
+ pub mod mem;
++#[cfg(target_os = "windows")]
++pub mod mtls_windows;
+ pub use lazy_static;
+ #[cfg(not(any(target_os = "android", target_os = "ios")))]
+ pub use mac_address;
+diff --git a/src/mtls_windows.rs b/src/mtls_windows.rs
+new file mode 100644
+index 0000000..90d2040
+--- /dev/null
++++ b/src/mtls_windows.rs
+@@ -0,0 +1,315 @@
++//! Windows-only mTLS transport for RustDesk ID and relay service endpoints.
++//!
++//! The private key never leaves the Current User certificate store. SChannel
++//! performs normal Windows chain and DNS-hostname validation.
++
++use crate::{
++    anyhow::{anyhow, Context},
++    config::Config,
++    tcp::FramedStream,
++    tokio,
++    ResultType,
++};
++use mio::{Events, Interest, Poll, Token, Waker};
++use schannel::{
++    cert_context::CertContext,
++    cert_store::CertStore,
++    schannel_cred::{Direction, SchannelCred},
++    tls_stream::{self, HandshakeError, MidHandshakeTlsStream, TlsStream},
++};
++use std::{
++    collections::VecDeque,
++    io::{self, ErrorKind, Read, Write},
++    net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs},
++    sync::{mpsc, Arc, Mutex},
++    task::{Context as TaskContext, Poll as TaskPoll},
++    time::Duration,
++};
++use tokio::{
++    io::{AsyncRead, AsyncWrite, ReadBuf},
++    sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
++};
++use x509_parser::prelude::*;
++
++const SOCKET: Token = Token(0);
++const WAKER: Token = Token(1);
++
++enum WorkerCommand {
++    Write(Vec<u8>),
++    Shutdown,
++}
++
++type Tls = TlsStream<mio::net::TcpStream>;
++type MidTls = MidHandshakeTlsStream<mio::net::TcpStream>;
++
++enum TlsState {
++    Handshake(MidTls),
++    Stream(Tls),
++}
++
++/// Tokio facade backed by a dedicated SChannel/mio worker.
++pub struct ChannelStream {
++    commands: mpsc::Sender<WorkerCommand>,
++    wake: Arc<Waker>,
++    incoming: Mutex<UnboundedReceiver<io::Result<Vec<u8>>>>,
++    pending: VecDeque<u8>,
++    closed: bool,
++}
++
++impl ChannelStream {
++    fn new(
++        commands: mpsc::Sender<WorkerCommand>,
++        wake: Arc<Waker>,
++        incoming: UnboundedReceiver<io::Result<Vec<u8>>>,
++    ) -> Self {
++        Self {
++            commands,
++            wake,
++            incoming: Mutex::new(incoming),
++            pending: VecDeque::new(),
++            closed: false,
++        }
++    }
++}
++
++impl AsyncRead for ChannelStream {
++    fn poll_read(
++        mut self: std::pin::Pin<&mut Self>,
++        cx: &mut TaskContext<'_>,
++        buf: &mut ReadBuf<'_>,
++    ) -> TaskPoll<io::Result<()>> {
++        while buf.remaining() > 0 {
++            match self.pending.pop_front() {
++                Some(byte) => buf.put_slice(&[byte]),
++                None => break,
++            }
++        }
++        if buf.filled().len() > 0 {
++            return TaskPoll::Ready(Ok(()));
++        }
++        if self.closed {
++            return TaskPoll::Ready(Ok(()));
++        }
++        let result = match self.incoming.lock() {
++            Ok(mut receiver) => receiver.poll_recv(cx),
++            Err(_) => return TaskPoll::Ready(Err(io::Error::new(ErrorKind::Other, "mTLS reader poisoned"))),
++        };
++        match result {
++            TaskPoll::Ready(Some(Ok(bytes))) => {
++                self.pending.extend(bytes);
++                self.poll_read(cx, buf)
++            }
++            TaskPoll::Ready(Some(Err(error))) => TaskPoll::Ready(Err(error)),
++            TaskPoll::Ready(None) => {
++                self.closed = true;
++                TaskPoll::Ready(Ok(()))
++            }
++            TaskPoll::Pending => TaskPoll::Pending,
++        }
++    }
++}
++
++impl AsyncWrite for ChannelStream {
++    fn poll_write(
++        self: std::pin::Pin<&mut Self>,
++        _cx: &mut TaskContext<'_>,
++        buf: &[u8],
++    ) -> TaskPoll<io::Result<usize>> {
++        if self.closed {
++            return TaskPoll::Ready(Err(io::Error::new(ErrorKind::BrokenPipe, "mTLS stream is closed")));
++        }
++        self.commands
++            .send(WorkerCommand::Write(buf.to_vec()))
++            .map_err(|_| io::Error::new(ErrorKind::BrokenPipe, "mTLS worker stopped"))?;
++        self.wake.wake()?;
++        TaskPoll::Ready(Ok(buf.len()))
++    }
++
++    fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> TaskPoll<io::Result<()>> {
++        if self.closed { TaskPoll::Ready(Err(io::Error::new(ErrorKind::BrokenPipe, "mTLS stream is closed"))) } else { TaskPoll::Ready(Ok(())) }
++    }
++
++    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, _cx: &mut TaskContext<'_>) -> TaskPoll<io::Result<()>> {
++        if !self.closed {
++            let _ = self.commands.send(WorkerCommand::Shutdown);
++            let _ = self.wake.wake();
++            self.closed = true;
++        }
++        TaskPoll::Ready(Ok(()))
++    }
++}
++
++fn endpoint(target: &str) -> ResultType<(String, u16)> {
++    let (host, port) = target.rsplit_once(':').context("mTLS endpoint must contain host and port")?;
++    if host.is_empty() || host.contains(':') || host.parse::<IpAddr>().is_ok() {
++        anyhow::bail!("Windows mTLS endpoint must use a DNS hostname, not an IP literal");
++    }
++    let port: u16 = port.parse().context("Invalid Windows mTLS endpoint port")?;
++    if port == 0 { anyhow::bail!("Windows mTLS endpoint port must not be zero"); }
++    Ok((host.to_owned(), port))
++}
++
++fn certificate_is_eligible(cert: &CertContext) -> bool {
++    if !matches!(cert.is_time_valid(), Ok(true))
++        || cert
++            .private_key()
++            .compare_key(true)
++            .silent(true)
++            .acquire()
++            .is_err()
++    {
++        return false;
++    }
++    let Ok((_, parsed)) = parse_x509_certificate(cert.to_der()) else { return false; };
++    let ou_matches = parsed.subject().iter_organizational_unit().any(|ou| ou.as_str().ok() == Some("RustDeskClient"));
++    if !ou_matches { return false; }
++    match parsed.extended_key_usage() {
++        Ok(Some(eku)) => eku.value.client_auth || eku.value.any,
++        Ok(None) => true,
++        Err(_) => false,
++    }
++}
++
++fn select_certificate() -> ResultType<CertContext> {
++    let store = CertStore::open_current_user("My")?;
++    let certificates: Vec<_> = store.certs().filter(certificate_is_eligible).collect();
++    match certificates.len() {
++        0 => anyhow::bail!("No eligible RustDeskClient certificate with a private key exists in Current User\\My"),
++        1 => Ok(certificates.into_iter().next().unwrap()),
++        _ => anyhow::bail!("Multiple eligible RustDeskClient certificates exist in Current User\\My"),
++    }
++}
++
++fn update_interest(poll: &Poll, socket: &mut mio::net::TcpStream, handshake: bool, writing: bool) -> io::Result<()> {
++    let interest = if handshake || writing {
++        Interest::READABLE.add(Interest::WRITABLE)
++    } else {
++        Interest::READABLE
++    };
++    poll.registry().reregister(socket, SOCKET, interest)
++}
++
++fn finish_handshake(state: TlsState) -> Result<TlsState, HandshakeError<mio::net::TcpStream>> {
++    match state {
++        TlsState::Handshake(handshake) => handshake.handshake().map(TlsState::Stream).or_else(|error| match error {
++            HandshakeError::Interrupted(next) => Ok(TlsState::Handshake(next)),
++            HandshakeError::Failure(error) => Err(HandshakeError::Failure(error)),
++        }),
++        stream => Ok(stream),
++    }
++}
++
++fn worker(
++    mut state: TlsState,
++    mut socket: mio::net::TcpStream,
++    mut poll: Poll,
++    mut commands: mpsc::Receiver<WorkerCommand>,
++    sender: UnboundedSender<io::Result<Vec<u8>>>,
++) {
++    let mut events = Events::with_capacity(32);
++    let mut writes = VecDeque::<Vec<u8>>::new();
++    let mut active_write: Option<(Vec<u8>, usize)> = None;
++    let mut handshake = matches!(state, TlsState::Handshake(_));
++    if let Err(error) = poll.registry().register(&mut socket, SOCKET, Interest::READABLE.add(Interest::WRITABLE)) {
++        let _ = sender.send(Err(error));
++        return;
++    }
++    loop {
++        let writing = active_write.is_some() || !writes.is_empty();
++        if let Err(error) = update_interest(&poll, &mut socket, handshake, writing) {
++            let _ = sender.send(Err(error));
++            return;
++        }
++        if let Err(error) = poll.poll(&mut events, Some(Duration::from_secs(30))) {
++            let _ = sender.send(Err(error));
++            return;
++        }
++        for event in events.iter() {
++            if event.token() == WAKER {
++                while let Ok(command) = commands.try_recv() {
++                    match command {
++                        WorkerCommand::Write(bytes) => writes.push_back(bytes),
++                        WorkerCommand::Shutdown => return,
++                    }
++                }
++                continue;
++            }
++            if handshake && (event.is_readable() || event.is_writable()) {
++                match finish_handshake(state) {
++                    Ok(next) => {
++                        handshake = matches!(next, TlsState::Handshake(_));
++                        state = next;
++                    }
++                    Err(HandshakeError::Failure(error)) => { let _ = sender.send(Err(error)); return; }
++                    Err(HandshakeError::Interrupted(_)) => unreachable!(),
++                }
++                if handshake { continue; }
++            }
++            let TlsState::Stream(tls) = &mut state else { continue; };
++            if event.is_readable() {
++                loop {
++                    let mut buffer = vec![0; 16 * 1024];
++                    match tls.read(&mut buffer) {
++                        Ok(0) => return,
++                        Ok(size) => { buffer.truncate(size); if sender.send(Ok(buffer)).is_err() { return; } }
++                        Err(error) if error.kind() == ErrorKind::WouldBlock => break,
++                        Err(error) => { let _ = sender.send(Err(error)); return; }
++                    }
++                }
++            }
++            if event.is_writable() {
++                loop {
++                    if active_write.is_none() { active_write = writes.pop_front().map(|bytes| (bytes, 0)); }
++                    let Some((bytes, offset)) = active_write.as_mut() else { break; };
++                    match tls.write(&bytes[*offset..]) {
++                        Ok(size) => {
++                            *offset += size;
++                            if *offset == bytes.len() { active_write = None; } else { continue; }
++                        }
++                        Err(error) if error.kind() == ErrorKind::WouldBlock => break,
++                        Err(error) => { let _ = sender.send(Err(error)); return; }
++                    }
++                }
++            }
++        }
++        while let Ok(command) = commands.try_recv() {
++            match command {
++                WorkerCommand::Write(bytes) => writes.push_back(bytes),
++                WorkerCommand::Shutdown => return,
++            }
++        }
++    }
++}
++
++pub async fn connect_service(target: String, timeout_ms: u64) -> ResultType<FramedStream> {
++    if Config::get_socks().is_some() {
++        anyhow::bail!("Windows mTLS service connections do not support SOCKS proxies");
++    }
++    let (host, port) = endpoint(&target)?;
++    tokio::task::spawn_blocking(move || -> ResultType<FramedStream> {
++        let remote = (host.as_str(), port).to_socket_addrs()?.next().context("Failed to resolve Windows mTLS hostname")?;
++        let stream = TcpStream::connect_timeout(&remote, Duration::from_millis(timeout_ms))?;
++        stream.set_nodelay(true)?;
++        let local_addr = stream.local_addr()?;
++        stream.set_nonblocking(true)?;
++        let mio_stream = mio::net::TcpStream::from_std(stream);
++        let polling_stream = mio_stream.try_clone()?;
++        let certificate = select_certificate()?;
++        let mut credentials = SchannelCred::builder();
++        credentials.cert(certificate);
++        let credentials = credentials.acquire(Direction::Outbound)?;
++        let mut builder = tls_stream::Builder::new();
++        builder.domain(&host);
++        let state = match builder.connect(credentials, mio_stream) {
++            Ok(tls) => TlsState::Stream(tls),
++            Err(HandshakeError::Interrupted(handshake)) => TlsState::Handshake(handshake),
++            Err(HandshakeError::Failure(error)) => return Err(error.into()),
++        };
++        let poll = Poll::new()?;
++        let wake = Arc::new(Waker::new(poll.registry(), WAKER)?);
++        let (commands_tx, commands_rx) = mpsc::channel();
++        let (incoming_tx, incoming_rx) = unbounded_channel();
++        std::thread::Builder::new().name("rustdesk-mtls-schannel".into()).spawn(move || worker(state, polling_stream, poll, commands_rx, incoming_tx))?;
++        Ok(FramedStream::from(ChannelStream::new(commands_tx, wake, incoming_rx), local_addr))
++    }).await.map_err(|error| anyhow!("Windows mTLS worker failed: {error}"))?
++}
+diff --git a/src/socket_client.rs b/src/socket_client.rs
+index 9178b74..fe8baa0 100644
+--- a/src/socket_client.rs
++++ b/src/socket_client.rs
+@@ -146,6 +146,19 @@ pub async fn connect_tcp<
+     connect_tcp_local(target, None, ms_timeout).await
+ }
+ 
++/// Connect an ID/relay endpoint through the Windows system-certificate mTLS
++/// transport. This is intentionally separate from `connect_tcp` so direct
++/// peers, proxies, WebSocket, and WebRTC retain their upstream semantics.
++#[cfg(target_os = "windows")]
++pub async fn connect_tcp_mtls_service(
++    target: String,
++    ms_timeout: u64,
++) -> ResultType<Stream> {
++    Ok(Stream::Tcp(
++        crate::mtls_windows::connect_service(target, ms_timeout).await?,
++    ))
++}
++
+ // This function connects directly to the target without checking for websocket endpoints.
+ pub async fn connect_tcp_local<
+     't,

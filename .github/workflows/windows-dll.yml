@@ -1,0 +1,87 @@
+name: Build Windows x64 DLL
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Artifact version label
+        required: true
+        default: "1.4.9"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-dll-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-2022
+    env:
+      VCPKG_BINARY_SOURCES: clear
+      VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          submodules: recursive
+
+      - name: Apply Windows mTLS patch
+        shell: pwsh
+        run: |
+          git -C libs/hbb_common apply --check ../../.github/patches/hbb_common_windows_mtls.diff
+          git -C libs/hbb_common apply ../../.github/patches/hbb_common_windows_mtls.diff
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0
+        with:
+          version: 15.0.6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: 1.75
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt
+
+      - name: Setup vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2
+        with:
+          vcpkgDirectory: C:\vcpkg
+          vcpkgGitCommitId: 120deac3062162151622ca4860575a33844ba10b
+          doNotCache: true
+
+      - name: Install static vcpkg dependencies
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_ROOT\vcpkg.exe" install --triplet x64-windows-static --x-install-root="$env:VCPKG_ROOT\installed"
+          $include = Join-Path $env:VCPKG_ROOT "installed\x64-windows-static\include"
+          if (-not (Test-Path (Join-Path $include "libavcodec\avcodec.h"))) {
+            throw "ffmpeg headers are missing from x64-windows-static"
+          }
+          if (-not (Test-Path (Join-Path $include "libavutil\pixfmt.h"))) {
+            throw "libavutil headers are missing from x64-windows-static"
+          }
+
+      - name: Build RustDesk DLL
+        shell: pwsh
+        run: cargo build --locked --release --lib --features "flutter,hwcodec,vram"
+
+      - name: Verify DLL
+        shell: pwsh
+        run: |
+          if (-not (Test-Path target\release\librustdesk.dll)) {
+            throw "librustdesk.dll was not produced"
+          }
+          Get-FileHash target\release\librustdesk.dll -Algorithm SHA256
+
+      - name: Upload DLL artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: librustdesk-${{ inputs.version }}-windows-x64
+          path: target/release/librustdesk.dll
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0

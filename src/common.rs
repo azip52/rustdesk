@@ -42,6 +42,26 @@ use crate::{
     ui_interface::{get_api_server as ui_get_api_server, get_option, is_installed, set_option},
 };
 
+/// Connect an ID or relay service endpoint.
+///
+/// This deliberately remains narrower than `socket_client::connect_tcp`: only
+/// RustDesk service connections use the platform mTLS transports. Direct peer,
+/// proxy, WebSocket, and local connections keep their upstream behaviour.
+pub async fn connect_rustdesk_service(target: String, timeout_ms: u64) -> ResultType<Stream> {
+    #[cfg(target_os = "windows")]
+    {
+        socket_client::connect_tcp_mtls_service(target, timeout_ms).await
+    }
+    #[cfg(target_os = "android")]
+    {
+        crate::android_mtls::connect_service(target, timeout_ms).await
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "android")))]
+    {
+        socket_client::connect_tcp(target, timeout_ms).await
+    }
+}
+
 #[derive(Debug, Eq, PartialEq)]
 pub enum GrabState {
     Ready,
@@ -746,7 +766,7 @@ async fn test_rendezvous_server_() {
     for host in servers {
         futs.push(tokio::spawn(async move {
             let tm = std::time::Instant::now();
-            if socket_client::connect_tcp(
+            if connect_rustdesk_service(
                 crate::check_port(&host, RENDEZVOUS_PORT),
                 CONNECT_TIMEOUT,
             )

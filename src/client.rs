@@ -391,7 +391,7 @@ impl Client {
         bool,
     )> {
         let mut start = Instant::now();
-        let mut socket = connect_tcp(&*rendezvous_server, CONNECT_TIMEOUT).await;
+        let mut socket = crate::connect_rustdesk_service(rendezvous_server.clone(), CONNECT_TIMEOUT).await;
         debug_assert!(!servers.contains(&rendezvous_server));
         let rtt = start.elapsed();
         log::debug!("TCP connection establishment time used: {:?}", rtt);
@@ -399,7 +399,7 @@ impl Client {
             log::info!("try the other servers: {:?}", servers);
             for server in servers {
                 let server = check_port(server, RENDEZVOUS_PORT);
-                socket = connect_tcp(&*server, CONNECT_TIMEOUT).await;
+                socket = crate::connect_rustdesk_service(server.clone(), CONNECT_TIMEOUT).await;
                 if socket.is_ok() {
                     rendezvous_server = server;
                     break;
@@ -851,7 +851,7 @@ impl Client {
 
         for i in 1..=3 {
             // use different socket due to current hbbs implementation requiring different nat address for each attempt
-            let mut socket = connect_tcp(rendezvous_server, CONNECT_TIMEOUT)
+            let mut socket = crate::connect_rustdesk_service(rendezvous_server.to_owned(), CONNECT_TIMEOUT)
                 .await
                 .with_context(|| "Failed to connect to rendezvous server")?;
 
@@ -908,7 +908,7 @@ impl Client {
         conn_type: ConnType,
         ipv4: bool,
     ) -> ResultType<Stream> {
-        let mut conn = connect_tcp(
+        let mut conn = crate::connect_rustdesk_service(
             ipv4_to_ipv6(check_port(relay_server, RELAY_PORT), ipv4),
             CONNECT_TIMEOUT,
         )
@@ -4028,7 +4028,7 @@ async fn hc_connection_(
     let mut keep_alive = crate::DEFAULT_KEEP_ALIVE;
 
     let host = check_port(&rendezvous_server, RENDEZVOUS_PORT);
-    let mut conn = connect_tcp(host.clone(), CONNECT_TIMEOUT).await?;
+    let mut conn = crate::connect_rustdesk_service(host.clone(), CONNECT_TIMEOUT).await?;
     let key = crate::get_key(true).await;
     crate::secure_tcp(&mut conn, &key).await?;
     let mut msg_out = RendezvousMessage::new();

@@ -320,7 +320,7 @@ async fn create_relay_connection_(
     ipv4: bool,
     meta: ConnectionMeta,
 ) -> ResultType<()> {
-    let mut stream = socket_client::connect_tcp(
+    let mut stream = crate::connect_rustdesk_service(
         socket_client::ipv4_to_ipv6(crate::check_port(relay_server, RELAY_PORT), ipv4),
         CONNECT_TIMEOUT,
     )

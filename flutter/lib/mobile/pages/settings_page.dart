@@ -722,6 +722,27 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                     setState(callback);
                   });
                 }),
+          if (isAndroid && !disabledSettings && !_hideNetwork && !_hideServer)
+            SettingsTile(
+              title: const Text('mTLS client certificate'),
+              description: const Text(
+                  'Choose a RustDeskClient certificate from Android system credentials'),
+              leading: const Icon(Icons.verified_user),
+              onPressed: (context) async {
+                try {
+                  await gFFI.invokeMethod('select_mtls_client_certificate');
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                        content: Text('mTLS client certificate selected')));
+                  }
+                } catch (_) {
+                  if (context.mounted) {
+                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
+                        content: Text('No valid mTLS client certificate was selected')));
+                  }
+                }
+              },
+            ),
           if (!_hideNetwork && !_hideProxy)
             SettingsTile(
                 title: Text(translate('Socks5/Http(s) Proxy')),

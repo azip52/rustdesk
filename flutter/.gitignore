@@ -40,10 +40,6 @@ app.*.map.json
 jniLibs
 .vscode
 
-# flutter rust bridge
-lib/generated_bridge.dart
-lib/generated_bridge.freezed.dart
-
 # Flutter Generated Files
 **/GeneratedPluginRegistrant.swift
 **/flutter/generated_plugin_registrant.cc
