@@ -1,1 +1,5 @@
 * text=auto
+
+# Unified patch context represents an empty source line as a single prefix
+# space. Do not report that required patch syntax as trailing whitespace.
+.github/patches/hbb_common_windows_mtls.diff whitespace=-trailing-space
