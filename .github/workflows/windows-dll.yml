@@ -22,6 +22,8 @@ jobs:
     env:
       VCPKG_BINARY_SOURCES: clear
       VCPKG_DEFAULT_HOST_TRIPLET: x64-windows-static
+      CARGO_NET_RETRY: "5"
+      CARGO_NET_GIT_FETCH_WITH_CLI: "true"
     steps:
       - name: Checkout source code
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
@@ -45,6 +47,20 @@ jobs:
           toolchain: 1.75
           targets: x86_64-pc-windows-msvc
           components: rustfmt
+
+      - name: Fetch locked Rust dependencies
+        shell: pwsh
+        run: |
+          $attempt = 1
+          while ($true) {
+            cargo fetch --locked --target x86_64-pc-windows-msvc
+            if ($LASTEXITCODE -eq 0) { break }
+            if ($attempt -ge 3) {
+              throw "cargo fetch failed after $attempt attempts"
+            }
+            Start-Sleep -Seconds ($attempt * 15)
+            $attempt++
+          }
 
       - name: Setup vcpkg
         uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2

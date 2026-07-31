@@ -56,7 +56,7 @@ index 0000000..90d2040
 +    net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs},
 +    sync::{mpsc, Arc, Mutex},
 +    task::{Context as TaskContext, Poll as TaskPoll},
-+    time::Duration,
++    time::{Duration, Instant},
 +};
 +use tokio::{
 +    io::{AsyncRead, AsyncWrite, ReadBuf},
@@ -78,6 +78,17 @@ index 0000000..90d2040
 +enum TlsState {
 +    Handshake(MidTls),
 +    Stream(Tls),
++}
++
++impl TlsState {
++    /// The exact socket currently owned by SChannel. Poll must never watch a
++    /// duplicated OS handle: readiness and SChannel I/O share this object.
++    fn socket_mut(&mut self) -> &mut mio::net::TcpStream {
++        match self {
++            TlsState::Handshake(handshake) => handshake.get_mut(),
++            TlsState::Stream(stream) => stream.get_mut(),
++        }
++    }
 +}
 +
 +/// Tokio facade backed by a dedicated SChannel/mio worker.
@@ -213,13 +224,13 @@ index 0000000..90d2040
 +    }
 +}
 +
-+fn update_interest(poll: &Poll, socket: &mut mio::net::TcpStream, handshake: bool, writing: bool) -> io::Result<()> {
++fn update_interest(poll: &Poll, state: &mut TlsState, handshake: bool, writing: bool) -> io::Result<()> {
 +    let interest = if handshake || writing {
 +        Interest::READABLE.add(Interest::WRITABLE)
 +    } else {
 +        Interest::READABLE
 +    };
-+    poll.registry().reregister(socket, SOCKET, interest)
++    poll.registry().reregister(state.socket_mut(), SOCKET, interest)
 +}
 +
 +fn finish_handshake(state: TlsState) -> Result<TlsState, HandshakeError<mio::net::TcpStream>> {
@@ -234,8 +245,8 @@ index 0000000..90d2040
 +
 +fn worker(
 +    mut state: TlsState,
-+    mut socket: mio::net::TcpStream,
 +    mut poll: Poll,
++    handshake_timeout: Duration,
 +    mut commands: mpsc::Receiver<WorkerCommand>,
 +    sender: UnboundedSender<io::Result<Vec<u8>>>,
 +) {
@@ -243,17 +254,27 @@ index 0000000..90d2040
 +    let mut writes = VecDeque::<Vec<u8>>::new();
 +    let mut active_write: Option<(Vec<u8>, usize)> = None;
 +    let mut handshake = matches!(state, TlsState::Handshake(_));
-+    if let Err(error) = poll.registry().register(&mut socket, SOCKET, Interest::READABLE.add(Interest::WRITABLE)) {
++    let handshake_deadline = Instant::now() + handshake_timeout;
++    if let Err(error) = poll.registry().register(state.socket_mut(), SOCKET, Interest::READABLE.add(Interest::WRITABLE)) {
 +        let _ = sender.send(Err(error));
 +        return;
 +    }
 +    loop {
++        if handshake && Instant::now() >= handshake_deadline {
++            let _ = sender.send(Err(io::Error::new(ErrorKind::TimedOut, "Windows SChannel mTLS handshake timed out")));
++            return;
++        }
 +        let writing = active_write.is_some() || !writes.is_empty();
-+        if let Err(error) = update_interest(&poll, &mut socket, handshake, writing) {
++        if let Err(error) = update_interest(&poll, &mut state, handshake, writing) {
 +            let _ = sender.send(Err(error));
 +            return;
 +        }
-+        if let Err(error) = poll.poll(&mut events, Some(Duration::from_secs(30))) {
++        let poll_timeout = if handshake {
++            Some(handshake_deadline.saturating_duration_since(Instant::now()))
++        } else {
++            Some(Duration::from_secs(30))
++        };
++        if let Err(error) = poll.poll(&mut events, poll_timeout) {
 +            let _ = sender.send(Err(error));
 +            return;
 +        }
@@ -326,7 +347,6 @@ index 0000000..90d2040
 +        let local_addr = stream.local_addr()?;
 +        stream.set_nonblocking(true)?;
 +        let mio_stream = mio::net::TcpStream::from_std(stream);
-+        let polling_stream = mio_stream.try_clone()?;
 +        let certificate = select_certificate()?;
 +        let mut credentials = SchannelCred::builder();
 +        credentials.cert(certificate);
@@ -342,7 +362,7 @@ index 0000000..90d2040
 +        let wake = Arc::new(Waker::new(poll.registry(), WAKER)?);
 +        let (commands_tx, commands_rx) = mpsc::channel();
 +        let (incoming_tx, incoming_rx) = unbounded_channel();
-+        std::thread::Builder::new().name("rustdesk-mtls-schannel".into()).spawn(move || worker(state, polling_stream, poll, commands_rx, incoming_tx))?;
++        std::thread::Builder::new().name("rustdesk-mtls-schannel".into()).spawn(move || worker(state, poll, Duration::from_millis(timeout_ms), commands_rx, incoming_tx))?;
 +        Ok(FramedStream::from(ChannelStream::new(commands_tx, wake, incoming_rx), local_addr))
 +    }).await.map_err(|error| anyhow!("Windows mTLS worker failed: {error}"))?
 +}
