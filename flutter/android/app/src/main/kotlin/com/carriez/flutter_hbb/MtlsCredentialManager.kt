@@ -54,7 +54,7 @@ class MtlsCredentialManager(private val context: Context) {
 
         private fun isValidCertificate(certificate: X509Certificate): Boolean {
             certificate.checkValidity()
-            val subject = certificate.subjectX500Principal.name(X500Principal.RFC2253)
+            val subject = certificate.subjectX500Principal.getName(X500Principal.RFC2253)
             val hasRequiredOu = splitRdns(subject).any { rdn ->
                 val separator = rdn.indexOf('=')
                 separator > 0 && rdn.substring(0, separator).equals("OU", true) &&
